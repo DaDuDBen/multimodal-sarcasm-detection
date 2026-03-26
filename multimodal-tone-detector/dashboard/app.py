@@ -51,7 +51,12 @@ def _init_state() -> None:
         "audio_capture_thread": None,
         "audio_transcribe_thread": None,
         "video_thread": None,
+        "video_consumer_thread": None,
         "video_queue": queue.Queue(),
+        "transcript_updates_queue": queue.Queue(),
+        "emotion_updates_queue": queue.Queue(),
+        "live_shared_state": {"latest_face_emotion": "unknown"},
+        "live_shared_state_lock": threading.Lock(),
         "history": [],
         "latest_transcript": "Waiting for speech...",
         "latest_face_emotion": "unknown",
@@ -68,18 +73,19 @@ def _init_state() -> None:
 # -----------------------------------------------------------------------------
 # Live mode workers
 # -----------------------------------------------------------------------------
-def _live_transcription_worker(stop_event: threading.Event) -> None:
+def _live_transcription_worker(
+    stop_event: threading.Event,
+    model: Any,
+    shared_state: dict[str, Any],
+    shared_state_lock: threading.Lock,
+    transcript_updates_queue: queue.Queue,
+) -> None:
     """Consume audio chunks, transcribe them, and update dashboard state.
 
     Notes:
     - Audio chunks are produced by `pipeline/audio.py::capture_audio`.
     - We load Whisper model once per dashboard session for efficiency.
     """
-    if st.session_state.live_whisper_model is None:
-        st.session_state.live_whisper_model = whisper.load_model("base")
-
-    model = st.session_state.live_whisper_model
-
     while not stop_event.is_set() or not audio_pipeline.audio_queue.empty():
         try:
             item = audio_pipeline.audio_queue.get(timeout=0.5)
@@ -93,13 +99,10 @@ def _live_transcription_worker(stop_event: threading.Event) -> None:
         except Exception:
             text = ""
 
-        # Update transcript whenever we get a non-empty text segment.
         if text:
-            st.session_state.latest_transcript = text
-
-            # Run NLP + fusion with latest facial emotion for current tone estimate.
             nlp_result = nlp.analyze_text(text)
-            face_emotion = st.session_state.latest_face_emotion
+            with shared_state_lock:
+                face_emotion = str(shared_state.get("latest_face_emotion", "unknown"))
 
             merged = {
                 "text": text,
@@ -110,34 +113,72 @@ def _live_transcription_worker(stop_event: threading.Event) -> None:
             }
             tone_result = fusion.classify_tone(merged)
 
-            st.session_state.latest_tone_label = tone_result["tone_label"]
-            st.session_state.latest_confidence = float(tone_result["tone_confidence"])
-
-            st.session_state.history.append(
+            transcript_updates_queue.put(
                 {
-                    "Timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "Transcript": text,
-                    "Face Emotion": face_emotion,
-                    "Tone Label": tone_result["tone_label"],
-                    "Confidence": float(tone_result["tone_confidence"]),
+                    "latest_transcript": text,
+                    "latest_tone_label": tone_result["tone_label"],
+                    "latest_confidence": float(tone_result["tone_confidence"]),
+                    "history_row": {
+                        "Timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "Transcript": text,
+                        "Face Emotion": face_emotion,
+                        "Tone Label": tone_result["tone_label"],
+                        "Confidence": float(tone_result["tone_confidence"]),
+                    },
                 }
             )
 
         audio_pipeline.audio_queue.task_done()
 
 
-def _live_video_consumer_worker(stop_event: threading.Event) -> None:
+def _live_video_consumer_worker(
+    stop_event: threading.Event,
+    video_queue: queue.Queue,
+    shared_state: dict[str, Any],
+    shared_state_lock: threading.Lock,
+    emotion_updates_queue: queue.Queue,
+) -> None:
     """Consume face-emotion predictions from the video queue and update state."""
-    video_queue: queue.Queue = st.session_state.video_queue
-
     while not stop_event.is_set() or not video_queue.empty():
         try:
             item = video_queue.get(timeout=0.5)
         except queue.Empty:
             continue
 
-        st.session_state.latest_face_emotion = str(item.get("emotion", "unknown"))
+        latest_face_emotion = str(item.get("emotion", "unknown"))
+        with shared_state_lock:
+            shared_state["latest_face_emotion"] = latest_face_emotion
+        emotion_updates_queue.put(latest_face_emotion)
         video_queue.task_done()
+
+
+def _drain_live_updates() -> None:
+    """Apply worker-thread updates onto Streamlit session state (main thread only)."""
+    emotion_updates_queue: queue.Queue | None = st.session_state.emotion_updates_queue
+    transcript_updates_queue: queue.Queue | None = st.session_state.transcript_updates_queue
+
+    if emotion_updates_queue is not None:
+        while True:
+            try:
+                st.session_state.latest_face_emotion = emotion_updates_queue.get_nowait()
+                emotion_updates_queue.task_done()
+            except queue.Empty:
+                break
+
+    if transcript_updates_queue is not None:
+        while True:
+            try:
+                update = transcript_updates_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            st.session_state.latest_transcript = str(update.get("latest_transcript", ""))
+            st.session_state.latest_tone_label = str(update.get("latest_tone_label", "Neutral / Sincere"))
+            st.session_state.latest_confidence = float(update.get("latest_confidence", 0.0))
+            history_row = update.get("history_row")
+            if isinstance(history_row, dict):
+                st.session_state.history.append(history_row)
+            transcript_updates_queue.task_done()
 
 
 # -----------------------------------------------------------------------------
@@ -151,6 +192,14 @@ def _start_live_mode() -> None:
     # Ensure previous stop flags are reset.
     audio_pipeline.stop_event.clear()
     stop_event = threading.Event()
+    if st.session_state.live_whisper_model is None:
+        st.session_state.live_whisper_model = whisper.load_model("base")
+
+    video_queue: queue.Queue = queue.Queue()
+    transcript_updates_queue: queue.Queue = queue.Queue()
+    emotion_updates_queue: queue.Queue = queue.Queue()
+    live_shared_state: dict[str, Any] = {"latest_face_emotion": "unknown"}
+    live_shared_state_lock = threading.Lock()
 
     # Reset live display values for a fresh run.
     st.session_state.latest_transcript = "Listening..."
@@ -167,14 +216,20 @@ def _start_live_mode() -> None:
 
     audio_transcribe_thread = threading.Thread(
         target=_live_transcription_worker,
-        args=(audio_pipeline.stop_event,),
+        args=(
+            audio_pipeline.stop_event,
+            st.session_state.live_whisper_model,
+            live_shared_state,
+            live_shared_state_lock,
+            transcript_updates_queue,
+        ),
         name="LiveAudioTranscribe",
         daemon=True,
     )
 
     video_thread = threading.Thread(
         target=video_pipeline.run_video_loop,
-        args=(st.session_state.video_queue, stop_event),
+        args=(video_queue, stop_event),
         kwargs={"show_preview": False},
         name="LiveVideoLoop",
         daemon=True,
@@ -182,7 +237,7 @@ def _start_live_mode() -> None:
 
     video_consumer_thread = threading.Thread(
         target=_live_video_consumer_worker,
-        args=(stop_event,),
+        args=(stop_event, video_queue, live_shared_state, live_shared_state_lock, emotion_updates_queue),
         name="LiveVideoConsumer",
         daemon=True,
     )
@@ -198,6 +253,11 @@ def _start_live_mode() -> None:
     st.session_state.audio_transcribe_thread = audio_transcribe_thread
     st.session_state.video_thread = video_thread
     st.session_state.video_consumer_thread = video_consumer_thread
+    st.session_state.video_queue = video_queue
+    st.session_state.transcript_updates_queue = transcript_updates_queue
+    st.session_state.emotion_updates_queue = emotion_updates_queue
+    st.session_state.live_shared_state = live_shared_state
+    st.session_state.live_shared_state_lock = live_shared_state_lock
     st.session_state.live_running = True
 
 
@@ -350,6 +410,7 @@ def main() -> None:
     mode = st.sidebar.radio("Select Mode", ["Live Webcam", "Upload Video File"])
 
     if mode == "Live Webcam":
+        _drain_live_updates()
         st.subheader("Live Tone Monitoring")
 
         control_col1, control_col2 = st.columns(2)
