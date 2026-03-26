@@ -10,6 +10,8 @@ from typing import Any
 import cv2
 from deepface import DeepFace
 
+frame_queue: queue.Queue = queue.Queue()
+
 
 def _parse_emotion_result(analysis: Any) -> tuple[str, float]:
     """Extract dominant emotion and confidence from DeepFace output.
@@ -66,6 +68,21 @@ def run_video_loop(
                 continue
 
             now = time.time()
+
+            frame_height, frame_width = frame.shape[:2]
+            resized_width = 480
+            resized_height = int(frame_height * (resized_width / frame_width))
+            resized_frame = cv2.resize(frame, (resized_width, resized_height))
+            rgb_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
+
+            while not frame_queue.empty():
+                try:
+                    frame_queue.get_nowait()
+                    frame_queue.task_done()
+                except queue.Empty:
+                    break
+
+            frame_queue.put(rgb_frame)
 
             # Skip analysis unless at least one second passed.
             if now - last_sample_time >= 1.0:
