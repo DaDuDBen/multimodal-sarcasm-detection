@@ -28,8 +28,10 @@ audio_queue: queue.Queue[dict[str, Any]] = queue.Queue()
 stop_event = threading.Event()
 
 
-def capture_audio() -> None:
+def capture_audio(external_stop_event: threading.Event | None = None) -> None:
     """Continuously capture microphone audio and push valid chunks into `audio_queue`."""
+    active_stop_event = external_stop_event or stop_event
+
     pa = pyaudio.PyAudio()
     stream = pa.open(
         format=pyaudio.paInt16,
@@ -46,12 +48,12 @@ def capture_audio() -> None:
     print("[Audio] Recording started...")
 
     try:
-        while not stop_event.is_set():
+        while not active_stop_event.is_set():
             frames: list[bytes] = []
 
             # Collect enough CHUNK_SIZE reads to build one 5-second window.
             for _ in range(chunks_per_window):
-                if stop_event.is_set():
+                if active_stop_event.is_set():
                     break
                 frames.append(stream.read(CHUNK_SIZE, exception_on_overflow=False))
 

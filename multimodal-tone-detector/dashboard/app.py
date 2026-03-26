@@ -62,6 +62,7 @@ def _init_state() -> None:
         "latest_face_emotion": "unknown",
         "latest_tone_label": "Neutral / Sincere",
         "latest_confidence": 0.0,
+        "latest_frame": None,
         "live_whisper_model": None,
     }
 
@@ -157,6 +158,13 @@ def _drain_live_updates() -> None:
     emotion_updates_queue: queue.Queue | None = st.session_state.emotion_updates_queue
     transcript_updates_queue: queue.Queue | None = st.session_state.transcript_updates_queue
 
+    while True:
+        try:
+            st.session_state.latest_frame = video_pipeline.frame_queue.get_nowait()
+            video_pipeline.frame_queue.task_done()
+        except queue.Empty:
+            break
+
     if emotion_updates_queue is not None:
         while True:
             try:
@@ -189,9 +197,7 @@ def _start_live_mode() -> None:
     if st.session_state.live_running:
         return
 
-    # Ensure previous stop flags are reset.
-    audio_pipeline.stop_event.clear()
-    stop_event = threading.Event()
+    st.session_state.stop_event = threading.Event()
     if st.session_state.live_whisper_model is None:
         st.session_state.live_whisper_model = whisper.load_model("base")
 
@@ -210,6 +216,7 @@ def _start_live_mode() -> None:
     # Build and start pipeline threads.
     audio_capture_thread = threading.Thread(
         target=audio_pipeline.capture_audio,
+        args=(st.session_state.stop_event,),
         name="LiveAudioCapture",
         daemon=True,
     )
@@ -217,7 +224,7 @@ def _start_live_mode() -> None:
     audio_transcribe_thread = threading.Thread(
         target=_live_transcription_worker,
         args=(
-            audio_pipeline.stop_event,
+            st.session_state.stop_event,
             st.session_state.live_whisper_model,
             live_shared_state,
             live_shared_state_lock,
@@ -229,7 +236,7 @@ def _start_live_mode() -> None:
 
     video_thread = threading.Thread(
         target=video_pipeline.run_video_loop,
-        args=(video_queue, stop_event),
+        args=(video_queue, st.session_state.stop_event),
         kwargs={"show_preview": False},
         name="LiveVideoLoop",
         daemon=True,
@@ -237,7 +244,7 @@ def _start_live_mode() -> None:
 
     video_consumer_thread = threading.Thread(
         target=_live_video_consumer_worker,
-        args=(stop_event, video_queue, live_shared_state, live_shared_state_lock, emotion_updates_queue),
+        args=(st.session_state.stop_event, video_queue, live_shared_state, live_shared_state_lock, emotion_updates_queue),
         name="LiveVideoConsumer",
         daemon=True,
     )
@@ -248,7 +255,6 @@ def _start_live_mode() -> None:
     video_consumer_thread.start()
 
     # Persist references in session state for lifecycle management.
-    st.session_state.stop_event = stop_event
     st.session_state.audio_capture_thread = audio_capture_thread
     st.session_state.audio_transcribe_thread = audio_transcribe_thread
     st.session_state.video_thread = video_thread
@@ -265,9 +271,6 @@ def _stop_live_mode() -> None:
     """Signal all running live-mode threads to stop."""
     if not st.session_state.live_running:
         return
-
-    # Signal both stop events (audio module event + local video event).
-    audio_pipeline.stop_event.set()
 
     if st.session_state.stop_event is not None:
         st.session_state.stop_event.set()
@@ -423,10 +426,20 @@ def main() -> None:
                 _stop_live_mode()
 
         # Live display placeholders (st.empty) used for frequent updates.
+        webcam_placeholder = st.empty()
         transcript_placeholder = st.empty()
         emotion_placeholder = st.empty()
         tone_placeholder = st.empty()
         confidence_placeholder = st.empty()
+
+        if st.session_state.latest_frame is not None:
+            webcam_placeholder.image(
+                st.session_state.latest_frame,
+                caption="Live Webcam Feed",
+                width=480,
+            )
+        else:
+            webcam_placeholder.info("Webcam feed will appear here when started.")
 
         transcript_placeholder.markdown(
             f"**Current Transcription (~5s):** {st.session_state.latest_transcript}"
