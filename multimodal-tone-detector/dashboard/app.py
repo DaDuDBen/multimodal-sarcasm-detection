@@ -348,6 +348,7 @@ def _process_video_file(video_path: Path) -> list[dict[str, Any]]:
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_index = 0
+    frame_interval = max(int(round(fps)), 1)
     next_sample = 0
     results: list[dict[str, Any]] = []
 
@@ -358,7 +359,7 @@ def _process_video_file(video_path: Path) -> list[dict[str, Any]]:
                 break
 
             if frame_index >= next_sample:
-                next_sample += int(fps)
+                next_sample += frame_interval
                 timestamp = frame_index / fps
 
                 try:

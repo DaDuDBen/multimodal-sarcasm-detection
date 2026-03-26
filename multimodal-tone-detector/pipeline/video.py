@@ -52,6 +52,7 @@ def run_video_loop(
         raise RuntimeError(f"Could not open camera index {camera_index}")
 
     # Track timing so we only analyze one frame per second.
+    start_time = time.time()
     last_sample_time = 0.0
     latest_emotion_text = "emotion: waiting..."
 
@@ -84,7 +85,9 @@ def run_video_loop(
                         {
                             "emotion": emotion,
                             "confidence": confidence,
-                            "timestamp": now,
+                            # Use relative timestamp so it aligns with audio timestamps
+                            # produced by pipeline.audio.capture_audio.
+                            "timestamp": now - start_time,
                         }
                     )
                     latest_emotion_text = f"emotion: {emotion} ({confidence:.1f}%)"

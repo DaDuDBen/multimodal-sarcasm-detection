@@ -7,3 +7,4 @@ transformers
 torch
 streamlit
 tf-keras
+ffmpeg-python
