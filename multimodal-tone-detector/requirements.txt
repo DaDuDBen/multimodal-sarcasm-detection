@@ -1,0 +1,9 @@
+openai-whisper
+pyaudio
+numpy
+opencv-python
+deepface
+transformers
+torch
+streamlit
+tf-keras
